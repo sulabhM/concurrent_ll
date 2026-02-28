@@ -1009,16 +1009,13 @@ TEST_CASE("New API: Iterator snapshot isolation", "[concurrent_ll][new_api][snap
     ll_insert_head(&list, create_item(1, 100));
     ll_insert_head(&list, create_item(2, 200));
 
-    SECTION("Items inserted after iterator begin may be visible based on txn_id")
+    SECTION("Items inserted after iterator begin are NOT visible (exclusive semantics)")
     {
         /*
          * Note on MVCC semantics: ll_iterator_begin captures snapshot = commit_id.
          * ll_insert_head does fetch_add, returning the OLD value as insert_txn_id.
-         * So if snapshot == 2 and we insert, the new node gets insert_txn_id == 2,
-         * which is visible (insert_txn_id <= snapshot).
-         *
-         * True isolation requires taking snapshot BEFORE any concurrent inserts
-         * complete their fetch_add. This test verifies the actual behavior.
+         * With EXCLUSIVE semantics (insert_txn_id < snapshot), items with
+         * insert_txn_id >= snapshot are NOT visible.
          */
         uint64_t snap_before = ll_iterator_snapshot(nullptr);  /* Get baseline - returns 0. */
         (void)snap_before;
@@ -1039,10 +1036,11 @@ TEST_CASE("New API: Iterator snapshot isolation", "[concurrent_ll][new_api][snap
         ll_iterator_end(&iter);
 
         /*
-         * The new item gets insert_txn_id == snapshot (due to fetch_add semantics),
-         * so it IS visible. This documents the actual MVCC behavior.
+         * With EXCLUSIVE semantics (insert_txn_id < snapshot), the new item
+         * gets insert_txn_id == snapshot, so it is NOT visible.
+         * Only the original 2 items are visible.
          */
-        REQUIRE(ids.size() == 3);
+        REQUIRE(ids.size() == 2);
         REQUIRE(snapshot >= 2);  /* At least 2 inserts happened before begin. */
 
         ll_destroy(&list, test_item_free_void);
@@ -1590,20 +1588,17 @@ TEST_CASE("Concurrent LL: Snapshot isolation - inserts after snapshot not visibl
   "[concurrent_ll][snapshot]")
 {
     /*
-     * The list uses MVCC where visibility is: insert_txn_id <= snapshot_version.
-     * An insert gets a txn_id BEFORE commit_id is incremented.
+     * The list uses MVCC where visibility is: insert_txn_id < snapshot_version (EXCLUSIVE).
+     * An insert gets a txn_id using fetch_add (returns OLD value before incrementing).
      * So if we take snapshot S, items with insert_txn_id >= S are NOT visible.
      *
      * Sequence:
      * 1. init: commit_id = 1
      * 2. insert item1: item1.insert_txn_id = 1, commit_id = 2
-     * 3. snapshot_begin: snap = 2 (sees items with insert_txn_id <= 2)
+     * 3. snapshot_begin: snap = 2 (sees items with insert_txn_id < 2, i.e., only txn_id 1)
      * 4. insert item2: item2.insert_txn_id = 2, commit_id = 3
      *
-     * item2.insert_txn_id (2) <= snap (2), so item2 IS visible.
-     *
-     * To test "inserts after snapshot not visible", we need snap < insert_txn_id.
-     * Take snapshot FIRST, then insert.
+     * item2.insert_txn_id (2) < snap (2) is FALSE, so item2 is NOT visible.
      */
     struct test_list_head list;
     ll_init(&list.head, &list.commit_id);
@@ -1612,10 +1607,8 @@ TEST_CASE("Concurrent LL: Snapshot isolation - inserts after snapshot not visibl
     /* Take a snapshot before any inserts. snap = 1 */
     uint64_t snap = ll_snapshot_begin_cxx(&list.commit_id);
 
-    /* Insert item1 after snapshot. item1.insert_txn_id = 1, but snap = 1, so 1 <= 1 is TRUE. */
-    /* Actually this still makes it visible. The semantics are that items with
-     * insert_txn_id <= snap are visible. To get "not visible", we need insert_txn_id > snap.
-     */
+    /* Insert item1 after snapshot. item1.insert_txn_id = 1, snap = 1, so 1 < 1 is FALSE. */
+    /* With EXCLUSIVE semantics, items with insert_txn_id >= snap are NOT visible. */
     ll_snapshot_end();
 
     /* Let's verify the basic behavior: items inserted before snapshot are visible. */
@@ -1632,9 +1625,9 @@ TEST_CASE("Concurrent LL: Snapshot isolation - inserts after snapshot not visibl
     test_item *item3 = create_item(3, 300);
     ll_insert_head(&list.head, &list.commit_id, item3);  /* insert_txn_id = 3, commit becomes 4 */
 
-    /* item3.insert_txn_id (3) <= snap (3), so item3 IS visible too.
-     * The semantics make concurrent inserts visible if they happen at the same "time".
-     * Let's just verify the correct count. */
+    /* item3.insert_txn_id (3) < snap (3) is FALSE, so item3 is NOT visible.
+     * With EXCLUSIVE semantics, only items with insert_txn_id < snap are visible.
+     * So only item1 and item2 (txn_id 1 and 2) are visible. */
     int count = 0;
     test_item *curr = static_cast<test_item *>(
       ll_snapshot_first(&list.head, &list.commit_id, snap));
@@ -1645,12 +1638,12 @@ TEST_CASE("Concurrent LL: Snapshot isolation - inserts after snapshot not visibl
     }
     ll_snapshot_end();
 
-    /* All 3 items have insert_txn_id <= snap(3), so all are visible. */
-    REQUIRE(count == 3);
+    /* Only items with insert_txn_id < snap(3) are visible, i.e., txn_id 1 and 2. */
+    REQUIRE(count == 2);
 
-    /* Now verify that with a LOWER snapshot, newer items aren't visible. */
-    /* Create a snapshot value manually that is less than item3's insert_txn_id. */
-    uint64_t old_snap = 2;  /* Only items with insert_txn_id <= 2 visible. */
+    /* Now verify that with a LOWER snapshot, even fewer items are visible. */
+    /* Create a snapshot value manually that excludes item2. */
+    uint64_t old_snap = 2;  /* Only items with insert_txn_id < 2 visible (just item1). */
     count = 0;
     curr = static_cast<test_item *>(
       ll_snapshot_first(&list.head, &list.commit_id, old_snap));
@@ -1659,8 +1652,8 @@ TEST_CASE("Concurrent LL: Snapshot isolation - inserts after snapshot not visibl
         curr = static_cast<test_item *>(
           ll_snapshot_next(&list.head, &list.commit_id, old_snap, curr));
     }
-    /* item1 (txn 1) and item2 (txn 2) visible, item3 (txn 3) not visible. */
-    REQUIRE(count == 2);
+    /* Only item1 (txn 1 < 2) is visible. item2 (txn 2) and item3 (txn 3) not visible. */
+    REQUIRE(count == 1);
 
     /* Cleanup. */
     ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
@@ -1673,7 +1666,7 @@ TEST_CASE("Concurrent LL: Snapshot isolation - removes after snapshot still visi
   "[concurrent_ll][snapshot]")
 {
     /*
-     * Visibility: insert_txn_id <= snap AND (removed_txn_id == 0 || removed_txn_id > snap)
+     * Visibility: insert_txn_id < snap AND (removed_txn_id == 0 || removed_txn_id > snap)
      *
      * Sequence:
      * 1. init: commit_id = 1
@@ -1683,7 +1676,7 @@ TEST_CASE("Concurrent LL: Snapshot isolation - removes after snapshot still visi
      * 5. remove item1: removed_txn_id = 3, commit = 4
      *
      * For item1 at snap=3:
-     * - insert_txn_id (1) <= snap (3): TRUE
+     * - insert_txn_id (1) < snap (3): TRUE
      * - removed_txn_id (3) > snap (3): FALSE (3 > 3 is false)
      * So item1 is NOT visible.
      *
@@ -1718,9 +1711,10 @@ TEST_CASE("Concurrent LL: Snapshot isolation - removes after snapshot still visi
     ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
     /* item1.removed_txn_id = 3 */
 
-    /* With pre_remove_snap = 2:
-     * item1: insert_txn (1) <= 2: TRUE, removed_txn (3) > 2: TRUE → VISIBLE
-     * item2: insert_txn (2) <= 2: TRUE, removed_txn (0) > 2: TRUE → VISIBLE
+    /* With pre_remove_snap = 2 and EXCLUSIVE semantics:
+     * item1: insert_txn (1) < 2: TRUE, removed_txn (3) > 2: TRUE → VISIBLE
+     * item2: insert_txn (2) < 2: FALSE → NOT VISIBLE
+     * Only item1 is visible.
      */
     std::vector<int> visible_ids;
     test_item *curr = static_cast<test_item *>(
@@ -1732,9 +1726,8 @@ TEST_CASE("Concurrent LL: Snapshot isolation - removes after snapshot still visi
     }
     ll_snapshot_end();
 
-    REQUIRE(visible_ids.size() == 2);
+    REQUIRE(visible_ids.size() == 1);
     REQUIRE(std::find(visible_ids.begin(), visible_ids.end(), 1) != visible_ids.end());
-    REQUIRE(std::find(visible_ids.begin(), visible_ids.end(), 2) != visible_ids.end());
 
     /* Verify that with current snapshot, removed item is NOT visible. */
     uint64_t new_snap = ll_snapshot_begin_cxx(&list.commit_id);
@@ -1959,19 +1952,31 @@ TEST_CASE("Concurrent LL: Active snapshot prevents reclamation", "[concurrent_ll
      * This test verifies that reclaim won't free nodes that might still be
      * visible to an active snapshot.
      *
-     * Sequence:
+     * With EXCLUSIVE semantics, we need: insert_txn_id < snap AND
+     * (removed_txn_id == 0 OR removed_txn_id > snap).
+     *
+     * Sequence to make an item visible after removal:
      * 1. init: commit_id = 1
-     * 2. insert item: insert_txn_id = 1, commit = 2
-     * 3. snapshot: snap = 2
-     * 4. remove item: removed_txn_id = 2, commit = 3
+     * 2. insert item1: insert_txn_id = 1, commit = 2
+     * 3. insert item2: insert_txn_id = 2, commit = 3
+     * 4. snapshot: snap = 3 (sees items with insert_txn < 3, i.e., item1)
+     * 5. remove item1: removed_txn_id = 3, commit = 4
      *
-     * For visibility at snap = 2:
-     * - removed_txn_id (2) > snap (2): FALSE
+     * For item1 at snap = 3:
+     * - insert_txn_id (1) < snap (3): TRUE
+     * - removed_txn_id (3) > snap (3): FALSE (3 > 3 is false)
+     * So item1 is NOT visible at snap = 3.
      *
-     * The item is NOT visible because removed_txn_id == snap.
+     * But at snap = 4:
+     * - insert_txn_id (1) < snap (4): TRUE
+     * - removed_txn_id (3) > snap (4): FALSE
+     * Still not visible.
      *
-     * To make the item visible after removal, we need removed_txn_id > snap.
-     * Use a snapshot value of snap - 1.
+     * We need snap where insert_txn < snap AND removed_txn > snap.
+     * With insert_txn = 1 and removed_txn = 3, snap = 2 works:
+     * - insert_txn (1) < snap (2): TRUE
+     * - removed_txn (3) > snap (2): TRUE
+     * Item IS visible at snap = 2.
      */
     struct test_list_head list;
     ll_init(&list.head, &list.commit_id);
@@ -1979,46 +1984,28 @@ TEST_CASE("Concurrent LL: Active snapshot prevents reclamation", "[concurrent_ll
 
     freed_count.store(0);
 
-    test_item *item = create_item(1, 100);
-    ll_insert_head(&list.head, &list.commit_id, item);  /* insert_txn = 1, commit = 2 */
+    test_item *item1 = create_item(1, 100);
+    ll_insert_head(&list.head, &list.commit_id, item1);  /* insert_txn = 1, commit = 2 */
 
-    /* Get current commit_id for reference. */
-    uint64_t current_commit = ll_snapshot_begin_cxx(&list.commit_id);  /* = 2 */
+    test_item *item2 = create_item(2, 200);
+    ll_insert_head(&list.head, &list.commit_id, item2);  /* insert_txn = 2, commit = 3 */
+
+    /* Take snapshot at commit = 3. */
+    uint64_t snap_before_remove = ll_snapshot_begin_cxx(&list.commit_id);  /* = 3 */
     ll_snapshot_end();
 
-    /* Remove the item. */
-    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item);
-    /* removed_txn_id = 2, commit = 3 */
+    /* Remove item1. */
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
+    /* removed_txn_id = 3, commit = 4 */
 
-    /* Use a snapshot value BEFORE the remove: snap = 1
-     * At snap = 1:
-     * - insert_txn_id (1) <= snap (1): TRUE
-     * - removed_txn_id (2) > snap (1): TRUE
-     * So item IS visible.
+    /* Use snap = snap_before_remove - 1 = 2 to see item1 after it was removed.
+     * At snap = 2:
+     * - item1: insert_txn (1) < 2: TRUE, removed_txn (3) > 2: TRUE → VISIBLE
+     * - item2: insert_txn (2) < 2: FALSE → NOT VISIBLE
      */
-    uint64_t old_snap = current_commit - 1;  /* = 1 */
+    uint64_t old_snap = snap_before_remove - 1;  /* = 2 */
 
-    /* Start an active snapshot to prevent reclamation. */
-    (void)ll_snapshot_begin_cxx(&list.commit_id);
-
-    /* Try to reclaim - the active snapshot should prevent freeing nodes
-     * that were removed at a version >= min_active_snapshot.
-     * The reclaim logic: reclaimable = (rid != 0 && rid < min_active)
-     * With active snapshot at commit_id = 3, min_active = 3.
-     * rid = 2 < 3, so it IS reclaimable... unless the snapshot is older.
-     *
-     * Actually the snapshot stores the version at time of snapshot_begin.
-     * So if we call ll_snapshot_begin now (commit = 3), min_active = 3.
-     * rid = 2 < 3 means the node IS reclaimable.
-     *
-     * To prevent reclamation, we'd need min_active <= rid.
-     * That would require an active snapshot at version <= 2.
-     *
-     * Let's just verify the basic reclaim behavior works.
-     */
-    ll_snapshot_end();
-
-    /* Item should be visible with old_snap. */
+    /* Item1 should be visible with old_snap = 2. */
     test_item *first = static_cast<test_item *>(
       ll_snapshot_first(&list.head, &list.commit_id, old_snap));
     REQUIRE(first != nullptr);

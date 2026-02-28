@@ -4,7 +4,7 @@
  * Lock-free, thread-safe singly linked list with MVCC semantics.
  *
  * Visibility rule: A node is visible at snapshot S if:
- *   insert_txn_id <= S AND (removed_txn_id == 0 OR removed_txn_id > S)
+ *   insert_txn_id < S AND (removed_txn_id == 0 OR removed_txn_id > S)
  *
  * Memory safety is ensured via hazard pointers:
  * - Each thread can protect up to HP_SLOTS_PER_THREAD pointers
@@ -70,7 +70,7 @@ static inline bool node_visible(versioned_node_t *w, uint64_t snapshot)
     if (!w)
         return false;
     uint64_t rid = atomic_load_explicit(&w->removed_txn_id, memory_order_acquire);
-    return w->insert_txn_id <= snapshot && (rid == 0 || rid > snapshot);
+    return w->insert_txn_id < snapshot && (rid == 0 || rid > snapshot);
 }
 
 /* ============== Domain Management ============== */

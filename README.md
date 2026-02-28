@@ -113,8 +113,10 @@ Each node has two transaction IDs:
 
 A node is **visible** at snapshot version `S` if:
 ```
-insert_txn_id <= S AND (removed_txn_id == 0 OR removed_txn_id > S)
+insert_txn_id < S AND (removed_txn_id == 0 OR removed_txn_id > S)
 ```
+
+This uses **exclusive** semantics for transaction visibility model, where transaction IDs greater than or equal to the snapshot are not visible.
 
 ### Hazard Pointers
 

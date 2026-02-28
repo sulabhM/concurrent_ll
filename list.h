@@ -11,7 +11,7 @@
  * - Per-list state (multiple independent lists supported)
  *
  * Visibility rule: A node is visible at snapshot S if:
- *   insert_txn_id <= S AND (removed_txn_id == 0 OR removed_txn_id > S)
+ *   insert_txn_id < S AND (removed_txn_id == 0 OR removed_txn_id > S)
  *
  * Usage:
  *   1. Create a domain with ll_domain_create() - shared by related lists
