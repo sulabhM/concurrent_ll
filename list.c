@@ -70,7 +70,17 @@ static inline bool node_visible(versioned_node_t *w, uint64_t snapshot)
     if (!w)
         return false;
     uint64_t rid = atomic_load_explicit(&w->removed_txn_id, memory_order_acquire);
-    return w->insert_txn_id < snapshot && (rid == 0 || rid > snapshot);
+    /*
+     * A node is visible if:
+     * 1. It was inserted BEFORE the snapshot (insert_txn_id < snapshot)
+     * 2. It is NOT removed, OR was removed AT OR AFTER the snapshot (rid == 0 || rid >= snapshot)
+     *
+     * Note: We use >= for rid because both snapshot_begin and ll_remove use atomic_fetch_add
+     * which returns the OLD value. If a snapshot and remove happen concurrently, they may get
+     * the same txn_id value. In that case, the remove is considered "after" the snapshot
+     * in our MVCC model, so the node should still be visible to that snapshot.
+     */
+    return w->insert_txn_id < snapshot && (rid == 0 || rid >= snapshot);
 }
 
 /* ============== Domain Management ============== */

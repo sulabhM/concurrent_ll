@@ -1353,12 +1353,18 @@ TEST_CASE("New API: Remove visibility semantics", "[concurrent_ll][new_api][visi
     ll_insert_head(&list, item1);
     ll_insert_head(&list, item2);
 
-    SECTION("Item removed at same snapshot moment is not visible")
+    SECTION("Item removed at same snapshot moment IS visible")
     {
         ll_iterator_t iter;
         REQUIRE(ll_iterator_begin(&list, &iter) == LL_OK);
 
-        /* Remove item1 - this gets removed_txn_id == snapshot. */
+        /*
+         * Remove item1 - this gets removed_txn_id == snapshot.
+         * With our MVCC semantics, if remove and snapshot get the same
+         * commit_id value, the snapshot is considered to have happened
+         * "first" (logically), so the item IS still visible to the snapshot.
+         * This is the safe behavior for WiredTiger's dhandle use case.
+         */
         REQUIRE(ll_remove(&list, item1) == LL_OK);
 
         std::vector<int> ids;
@@ -1368,9 +1374,8 @@ TEST_CASE("New API: Remove visibility semantics", "[concurrent_ll][new_api][visi
         }
         ll_iterator_end(&iter);
 
-        /* Only item2 is visible (item1 was removed at snapshot moment). */
-        REQUIRE(ids.size() == 1);
-        REQUIRE(ids[0] == 2);
+        /* Both items are visible (remove at same snapshot moment doesn't hide). */
+        REQUIRE(ids.size() == 2);
 
         ll_reclaim(&list, test_item_free_void);
         ll_destroy(&list, test_item_free_void);
