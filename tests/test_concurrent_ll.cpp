@@ -2130,3 +2130,268 @@ TEST_CASE("Example: Snapshot for consistent iteration", "[concurrent_ll][example
     ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
 }
 
+/* ==================== pthread TLS Robustness Tests ==================== */
+
+/*
+ * These tests specifically validate the pthread-based TLS implementation
+ * that replaced C11 _Thread_local variables for compatibility with threads
+ * created by external runtimes (Python, Java, etc.).
+ */
+
+TEST_CASE("pthread TLS: Thread-local state isolation", "[concurrent_ll][tls][pthread]")
+{
+    /*
+     * Verify that each thread gets its own independent TLS copy.
+     * One thread's state should never be visible to another thread.
+     */
+    ll_domain_t *domain = ll_domain_create(8);
+    REQUIRE(domain != nullptr);
+
+    const int num_threads = 8;
+    std::atomic<int> threads_verified{0};
+    std::atomic<bool> isolation_violated{false};
+    std::vector<std::thread> threads;
+
+    /* Each thread registers, stores a unique value, and verifies isolation. */
+    for (int t = 0; t < num_threads; t++) {
+        threads.emplace_back([&, t]() {
+            /* Register this thread. */
+            REQUIRE(ll_thread_register(domain) == LL_OK);
+
+            /* After registration, the thread should have its own state.
+             * Perform operations that would fail if TLS is shared. */
+
+            /* Create a list and insert items unique to this thread. */
+            ll_head_t list;
+            REQUIRE(ll_init(&list, domain) == LL_OK);
+
+            for (int i = 0; i < 10; i++) {
+                test_item *item = create_item(t * 1000 + i, t);
+                REQUIRE(ll_insert_head(&list, item) == LL_OK);
+            }
+
+            /* Verify our items are still there and have our thread's value. */
+            ll_iterator_t iter;
+            REQUIRE(ll_iterator_begin(&list, &iter) == LL_OK);
+
+            int count = 0;
+            test_item *item;
+            while ((item = static_cast<test_item *>(ll_iterator_next(&iter))) != nullptr) {
+                /* Each item should have this thread's value. */
+                if (item->value != t) {
+                    isolation_violated.store(true);
+                }
+                count++;
+            }
+            ll_iterator_end(&iter);
+
+            if (count != 10) {
+                isolation_violated.store(true);
+            }
+
+            threads_verified.fetch_add(1);
+
+            /* Cleanup. */
+            ll_destroy(&list, test_item_free_void);
+            ll_thread_unregister(domain);
+        });
+    }
+
+    for (auto &thread : threads)
+        thread.join();
+
+    REQUIRE(threads_verified.load() == num_threads);
+    REQUIRE(isolation_violated.load() == false);
+
+    ll_domain_destroy(domain);
+}
+
+TEST_CASE("pthread TLS: Thread exit without explicit unregister", "[concurrent_ll][tls][pthread]")
+{
+    /*
+     * Test behavior when threads terminate without calling ll_thread_unregister().
+     * Since we don't use pthread_key_create with destructors, the slot should
+     * remain "occupied" until the domain is destroyed, but new threads should
+     * still be able to register (domain grows or reuses slots from properly
+     * unregistered threads).
+     *
+     * This test verifies:
+     * 1. Threads can exit without unregister (no crash)
+     * 2. Subsequent threads can still register
+     * 3. Domain cleanup works correctly
+     */
+    ll_domain_t *domain = ll_domain_create(4);
+    REQUIRE(domain != nullptr);
+
+    /* Phase 1: Create threads that exit WITHOUT unregistering. */
+    const int num_bad_threads = 4;
+    std::atomic<int> bad_threads_completed{0};
+
+    {
+        std::vector<std::thread> bad_threads;
+        for (int t = 0; t < num_bad_threads; t++) {
+            bad_threads.emplace_back([&]() {
+                REQUIRE(ll_thread_register(domain) == LL_OK);
+
+                /* Do some work. */
+                ll_head_t list;
+                REQUIRE(ll_init(&list, domain) == LL_OK);
+                ll_insert_head(&list, create_item(1, 100));
+
+                bad_threads_completed.fetch_add(1);
+
+                /* Intentionally DO NOT call ll_thread_unregister() */
+                /* Thread exits with TLS still set. */
+
+                /* Note: We don't destroy the list here either - this simulates
+                 * an unclean exit. The domain destruction should handle cleanup. */
+            });
+        }
+
+        for (auto &thread : bad_threads)
+            thread.join();
+    }
+
+    REQUIRE(bad_threads_completed.load() == num_bad_threads);
+
+    /* Phase 2: Create NEW threads that DO properly register/unregister.
+     * These should succeed despite the "leaked" slots from Phase 1. */
+    const int num_good_threads = 8;
+    std::atomic<int> good_threads_completed{0};
+
+    {
+        std::vector<std::thread> good_threads;
+        for (int t = 0; t < num_good_threads; t++) {
+            good_threads.emplace_back([&]() {
+                int ret = ll_thread_register(domain);
+                REQUIRE(ret == LL_OK);
+
+                /* Do some work. */
+                ll_head_t list;
+                REQUIRE(ll_init(&list, domain) == LL_OK);
+                ll_insert_head(&list, create_item(2, 200));
+                ll_destroy(&list, test_item_free_void);
+
+                good_threads_completed.fetch_add(1);
+
+                ll_thread_unregister(domain);
+            });
+        }
+
+        for (auto &thread : good_threads)
+            thread.join();
+    }
+
+    REQUIRE(good_threads_completed.load() == num_good_threads);
+
+    /* Domain destruction should not crash even with "leaked" slots. */
+    ll_domain_destroy(domain);
+}
+
+TEST_CASE("pthread TLS: Concurrent TLS access stress", "[concurrent_ll][tls][pthread][stress]")
+{
+    /*
+     * Stress test: Multiple threads rapidly performing operations that
+     * involve TLS access (get_tls_thread_state/set_tls_thread_state).
+     *
+     * This validates:
+     * 1. pthread_once initialization is race-free
+     * 2. pthread_getspecific/pthread_setspecific are thread-safe
+     * 3. No corruption under high contention
+     */
+    ll_domain_t *domain = ll_domain_create(16);
+    REQUIRE(domain != nullptr);
+
+    const int num_threads = 16;
+    const int iterations_per_thread = 100;
+    std::atomic<int> total_operations{0};
+    std::atomic<int> errors{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+
+    /* All threads wait at a barrier then hammer TLS simultaneously. */
+    std::atomic<int> ready_count{0};
+
+    for (int t = 0; t < num_threads; t++) {
+        threads.emplace_back([&, t]() {
+            /* Signal ready and wait for start. */
+            ready_count.fetch_add(1);
+            while (!start.load()) {
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < iterations_per_thread; i++) {
+                /* Register - accesses TLS. */
+                int ret = ll_thread_register(domain);
+                if (ret != LL_OK) {
+                    errors.fetch_add(1);
+                    continue;
+                }
+
+                /* Perform list operations - all involve TLS access. */
+                ll_head_t list;
+                ret = ll_init(&list, domain);
+                if (ret != LL_OK) {
+                    errors.fetch_add(1);
+                    ll_thread_unregister(domain);
+                    continue;
+                }
+
+                /* Insert - uses TLS for hazard pointers. */
+                test_item *item = create_item(t * 10000 + i, t);
+                ret = ll_insert_head(&list, item);
+                if (ret != LL_OK) {
+                    errors.fetch_add(1);
+                    delete item;
+                    ll_thread_unregister(domain);
+                    continue;
+                }
+
+                /* Iterate - uses TLS for snapshot. */
+                ll_iterator_t iter;
+                ret = ll_iterator_begin(&list, &iter);
+                if (ret == LL_OK) {
+                    void *elm = ll_iterator_next(&iter);
+                    if (elm != item) {
+                        errors.fetch_add(1);
+                    }
+                    ll_iterator_end(&iter);
+                }
+
+                /* Remove - uses TLS. */
+                ll_remove(&list, item);
+
+                /* Reclaim - uses TLS. */
+                ll_reclaim(&list, test_item_free_void);
+
+                total_operations.fetch_add(1);
+
+                /* Unregister - accesses TLS. */
+                ll_thread_unregister(domain);
+
+                /* Small yield to create more interleaving. */
+                if (i % 20 == 0) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+
+    /* Wait for all threads to be ready. */
+    while (ready_count.load() < num_threads) {
+        std::this_thread::yield();
+    }
+
+    /* Start all threads simultaneously. */
+    start.store(true);
+
+    for (auto &thread : threads)
+        thread.join();
+
+    /* Verify results. */
+    REQUIRE(errors.load() == 0);
+    REQUIRE(total_operations.load() == num_threads * iterations_per_thread);
+
+    ll_domain_destroy(domain);
+}
+

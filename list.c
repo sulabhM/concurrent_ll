@@ -15,6 +15,7 @@
 #include "list.h"
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdalign.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -53,9 +54,44 @@ struct ll_domain {
     atomic_flag resize_lock;           /* Lock for resizing threads array */
 };
 
-/* Thread-local: pointer to this thread's state in the domain. */
-static _Thread_local ll_thread_state_t *tls_thread_state = NULL;
-static _Thread_local ll_domain_t *tls_domain = NULL;
+/*
+ * Thread-local storage using pthread keys for compatibility with threads
+ * created by external runtimes (Python, Java, etc.) that may not properly
+ * initialize C11 _Thread_local storage.
+ */
+static pthread_key_t tls_thread_state_key;
+static pthread_key_t tls_domain_key;
+static pthread_once_t tls_keys_once = PTHREAD_ONCE_INIT;
+
+static void tls_keys_init(void)
+{
+    pthread_key_create(&tls_thread_state_key, NULL);
+    pthread_key_create(&tls_domain_key, NULL);
+}
+
+static inline ll_thread_state_t *get_tls_thread_state(void)
+{
+    pthread_once(&tls_keys_once, tls_keys_init);
+    return (ll_thread_state_t *)pthread_getspecific(tls_thread_state_key);
+}
+
+static inline void set_tls_thread_state(ll_thread_state_t *state)
+{
+    pthread_once(&tls_keys_once, tls_keys_init);
+    pthread_setspecific(tls_thread_state_key, state);
+}
+
+static inline ll_domain_t *get_tls_domain(void)
+{
+    pthread_once(&tls_keys_once, tls_keys_init);
+    return (ll_domain_t *)pthread_getspecific(tls_domain_key);
+}
+
+static inline void set_tls_domain(ll_domain_t *domain)
+{
+    pthread_once(&tls_keys_once, tls_keys_init);
+    pthread_setspecific(tls_domain_key, domain);
+}
 
 /* ============== Helper Functions ============== */
 
@@ -182,7 +218,7 @@ int ll_thread_register(ll_domain_t *domain)
         return LL_ERR_INVAL;
 
     /* Already registered with this domain? */
-    if (tls_domain == domain && tls_thread_state != NULL)
+    if (get_tls_domain() == domain && get_tls_thread_state() != NULL)
         return LL_OK;
 
     /* Find or create a slot. */
@@ -194,8 +230,8 @@ int ll_thread_register(ll_domain_t *domain)
         if (slot) {
             bool expected = false;
             if (atomic_compare_exchange_strong(&slot->in_use, &expected, true)) {
-                tls_thread_state = slot;
-                tls_domain = domain;
+                set_tls_thread_state(slot);
+                set_tls_domain(domain);
                 return LL_OK;
             }
         }
@@ -224,27 +260,28 @@ int ll_thread_register(ll_domain_t *domain)
     state->retired_list = NULL;
 
     domain->threads[idx] = state;
-    tls_thread_state = state;
-    tls_domain = domain;
+    set_tls_thread_state(state);
+    set_tls_domain(domain);
 
     return LL_OK;
 }
 
 void ll_thread_unregister(ll_domain_t *domain)
 {
-    if (!domain || tls_domain != domain || !tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!domain || get_tls_domain() != domain || !state)
         return;
 
     /* Clear hazard pointers and snapshot. */
     for (int i = 0; i < HP_SLOTS_PER_THREAD; i++)
-        atomic_store(&tls_thread_state->hazard_ptrs[i], NULL);
-    atomic_store(&tls_thread_state->active_snapshot, (uint64_t)0);
+        atomic_store(&state->hazard_ptrs[i], NULL);
+    atomic_store(&state->active_snapshot, (uint64_t)0);
 
     /* Mark slot as available for reuse. */
-    atomic_store(&tls_thread_state->in_use, false);
+    atomic_store(&state->in_use, false);
 
-    tls_thread_state = NULL;
-    tls_domain = NULL;
+    set_tls_thread_state(NULL);
+    set_tls_domain(NULL);
 }
 /* ============== Hazard Pointer Helpers ============== */
 
@@ -347,7 +384,7 @@ int ll_insert_head(ll_head_t *list, void *elm)
 {
     if (!list || !elm)
         return LL_ERR_INVAL;
-    if (!tls_thread_state)
+    if (!get_tls_thread_state())
         return LL_ERR_NOTHREAD;
 
     /* Allocate wrapper node. */
@@ -381,10 +418,9 @@ int ll_remove(ll_head_t *list, void *elm)
 {
     if (!list || !elm)
         return LL_ERR_INVAL;
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return LL_ERR_NOTHREAD;
-
-    ll_thread_state_t *state = tls_thread_state;
 
     /* Get transaction ID for the remove. */
     uint64_t txn_id = atomic_fetch_add_explicit(&list->commit_id, 1,
@@ -438,10 +474,9 @@ int ll_remove_first(ll_head_t *list, void **out_elm)
 {
     if (!list || !out_elm)
         return LL_ERR_INVAL;
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return LL_ERR_NOTHREAD;
-
-    ll_thread_state_t *state = tls_thread_state;
     uint64_t snapshot = atomic_load_explicit(&list->commit_id, memory_order_acquire);
 
     for (;;) {
@@ -514,7 +549,8 @@ int ll_iterator_begin(ll_head_t *list, ll_iterator_t *iter)
 {
     if (!list || !iter)
         return LL_ERR_INVAL;
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return LL_ERR_NOTHREAD;
 
     iter->list = list;
@@ -522,7 +558,7 @@ int ll_iterator_begin(ll_head_t *list, ll_iterator_t *iter)
     iter->current_node = NULL;
 
     /* Register active snapshot. */
-    atomic_store_explicit(&tls_thread_state->active_snapshot, iter->snapshot,
+    atomic_store_explicit(&state->active_snapshot, iter->snapshot,
                           memory_order_release);
 
     return LL_OK;
@@ -530,10 +566,10 @@ int ll_iterator_begin(ll_head_t *list, ll_iterator_t *iter)
 
 void *ll_iterator_next(ll_iterator_t *iter)
 {
-    if (!iter || !iter->list || !tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!iter || !iter->list || !state)
         return NULL;
 
-    ll_thread_state_t *state = tls_thread_state;
     versioned_node_t *curr;
 
     if (iter->current_node == NULL) {
@@ -570,8 +606,9 @@ void ll_iterator_end(ll_iterator_t *iter)
     if (!iter)
         return;
 
-    if (tls_thread_state) {
-        atomic_store_explicit(&tls_thread_state->active_snapshot, (uint64_t)0,
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (state) {
+        atomic_store_explicit(&state->active_snapshot, (uint64_t)0,
                               memory_order_release);
     }
 
@@ -643,11 +680,11 @@ size_t ll_count(ll_head_t *list)
 
 void ll_reclaim(ll_head_t *list, void (*free_cb)(void *))
 {
-    if (!list || !list->domain || !tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!list || !list->domain || !state)
         return;
 
     ll_domain_t *domain = list->domain;
-    ll_thread_state_t *state = tls_thread_state;
 
     uint64_t min_snap = min_active_snapshot(domain);
     if (min_snap == UINT64_MAX)
@@ -722,31 +759,36 @@ void ll_reclaim(ll_head_t *list, void (*free_cb)(void *))
 /*
  * Global default domain for legacy API.
  * Lazily initialized on first use.
+ * Must be atomic to prevent torn reads on ARM64 and other architectures.
  */
-static ll_domain_t *legacy_domain = NULL;
+static _Atomic(ll_domain_t *) legacy_domain = NULL;
 static atomic_flag legacy_init_lock = ATOMIC_FLAG_INIT;
 
 static ll_domain_t *get_legacy_domain(void)
 {
-    if (legacy_domain)
-        return legacy_domain;
+    ll_domain_t *domain = atomic_load_explicit(&legacy_domain, memory_order_acquire);
+    if (domain)
+        return domain;
 
-    while (atomic_flag_test_and_set(&legacy_init_lock)) {
+    while (atomic_flag_test_and_set_explicit(&legacy_init_lock, memory_order_acquire)) {
         /* Spin. */
     }
 
-    if (!legacy_domain) {
-        legacy_domain = ll_domain_create(32);
+    /* Re-check after acquiring lock. */
+    domain = atomic_load_explicit(&legacy_domain, memory_order_acquire);
+    if (!domain) {
+        domain = ll_domain_create(32);
+        atomic_store_explicit(&legacy_domain, domain, memory_order_release);
     }
 
-    atomic_flag_clear(&legacy_init_lock);
-    return legacy_domain;
+    atomic_flag_clear_explicit(&legacy_init_lock, memory_order_release);
+    return domain;
 }
 
 static void ensure_legacy_thread_registered(void)
 {
     ll_domain_t *domain = get_legacy_domain();
-    if (domain && tls_domain != domain) {
+    if (domain && get_tls_domain() != domain) {
         ll_thread_register(domain);
     }
 }
@@ -786,10 +828,9 @@ void *ll_remove_head_(atomic_uintptr_t *head, ll_commit_id_t *commit_id)
 {
     ensure_legacy_thread_registered();
 
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return NULL;
-
-    ll_thread_state_t *state = tls_thread_state;
     uint64_t snapshot = atomic_load_explicit(commit_id, memory_order_acquire);
 
     for (;;) {
@@ -861,10 +902,9 @@ int ll_remove_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
     (void)free_cb;  /* Unused in legacy API - kept for compatibility. */
     ensure_legacy_thread_registered();
 
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return LL_ERR_NOTHREAD;
-
-    ll_thread_state_t *state = tls_thread_state;
 
     uint64_t txn_id = atomic_fetch_add_explicit(commit_id, 1, memory_order_acq_rel);
 
@@ -913,8 +953,9 @@ uint64_t ll_snapshot_begin(ll_commit_id_t *commit_id)
 
     uint64_t snapshot = atomic_load_explicit(commit_id, memory_order_acquire);
 
-    if (tls_thread_state) {
-        atomic_store_explicit(&tls_thread_state->active_snapshot, snapshot,
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (state) {
+        atomic_store_explicit(&state->active_snapshot, snapshot,
                               memory_order_release);
     }
 
@@ -923,8 +964,9 @@ uint64_t ll_snapshot_begin(ll_commit_id_t *commit_id)
 
 void ll_snapshot_end(void)
 {
-    if (tls_thread_state) {
-        atomic_store_explicit(&tls_thread_state->active_snapshot, (uint64_t)0,
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (state) {
+        atomic_store_explicit(&state->active_snapshot, (uint64_t)0,
                               memory_order_release);
     }
 }
@@ -937,7 +979,7 @@ void *ll_snapshot_first_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
     if (snapshot_version == 0)
         snapshot_version = atomic_load_explicit(commit_id, memory_order_acquire);
 
-    ll_thread_state_t *state = tls_thread_state;
+    ll_thread_state_t *state = get_tls_thread_state();
     versioned_node_t *curr = ptr_unmask(
         atomic_load_explicit(head, memory_order_acquire));
 
@@ -968,7 +1010,7 @@ void *ll_snapshot_next_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
     if (snapshot_version == 0)
         snapshot_version = atomic_load_explicit(commit_id, memory_order_acquire);
 
-    ll_thread_state_t *state = tls_thread_state;
+    ll_thread_state_t *state = get_tls_thread_state();
     versioned_node_t *curr = ptr_unmask(
         atomic_load_explicit(head, memory_order_acquire));
 
@@ -1016,11 +1058,11 @@ void ll_reclaim_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
 {
     ensure_legacy_thread_registered();
 
-    if (!tls_thread_state)
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (!state)
         return;
 
     ll_domain_t *domain = get_legacy_domain();
-    ll_thread_state_t *state = tls_thread_state;
 
     uint64_t min_snap = min_active_snapshot(domain);
     if (min_snap == UINT64_MAX)
