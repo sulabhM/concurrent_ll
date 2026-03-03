@@ -23,6 +23,10 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-fvisibility=hidden)
+endif()
+
 # Thread support
 find_package(Threads REQUIRED)
 
