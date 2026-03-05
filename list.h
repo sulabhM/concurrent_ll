@@ -272,6 +272,58 @@ void *ll_snapshot_next_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
 void ll_reclaim_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
                  void (*free_cb)(void *));
 
+/* ============== Legacy Iterator API ============== */
+
+/*
+ * The following iterator functions work with the legacy API data structures
+ * (atomic_uintptr_t head + ll_commit_id_t commit_id) but provide O(1) next()
+ * operations instead of the O(N) ll_snapshot_next_() function.
+ *
+ * This is the recommended API for iterating over lists with many elements.
+ */
+
+/* Legacy iterator state - maintains cursor position for efficient traversal. */
+typedef struct ll_legacy_iter {
+    atomic_uintptr_t *head;       /* List head pointer */
+    ll_commit_id_t *commit_id;    /* List commit ID */
+    uint64_t snapshot;            /* Snapshot version for this traversal */
+    void *current_node;           /* Internal: current versioned_node pointer */
+} ll_legacy_iter_t;
+
+/*
+ * Begin iteration over a legacy list. Initializes the iterator with a
+ * snapshot of the current commit_id. Must be paired with ll_legacy_iter_end().
+ *
+ * @param iter       Iterator structure to initialize
+ * @param head       List head pointer
+ * @param commit_id  List commit ID
+ */
+void ll_legacy_iter_begin(ll_legacy_iter_t *iter, atomic_uintptr_t *head,
+                          ll_commit_id_t *commit_id);
+
+/*
+ * Get the next visible element from the iterator. O(1) amortized per call.
+ *
+ * @param iter  Iterator from ll_legacy_iter_begin()
+ * @return Next visible element, or NULL if no more elements
+ */
+void *ll_legacy_iter_next(ll_legacy_iter_t *iter);
+
+/*
+ * End iteration and release the snapshot.
+ *
+ * @param iter  Iterator to end
+ */
+void ll_legacy_iter_end(ll_legacy_iter_t *iter);
+
+/*
+ * Get the snapshot version from an iterator.
+ *
+ * @param iter  Active iterator
+ * @return Snapshot version
+ */
+uint64_t ll_legacy_iter_snapshot(const ll_legacy_iter_t *iter);
+
 #ifdef __cplusplus
 }
 #endif

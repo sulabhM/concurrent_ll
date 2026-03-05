@@ -2025,6 +2025,251 @@ TEST_CASE("Concurrent LL: Active snapshot prevents reclamation", "[concurrent_ll
      */
 }
 
+/* ==================== Legacy Iterator API Tests ==================== */
+
+TEST_CASE("Legacy Iterator: Basic iteration", "[concurrent_ll][legacy][iterator]")
+{
+    struct test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+    list.free_cb = test_item_free;
+
+    /* Insert items 1, 2, 3 at head (so order becomes 3, 2, 1). */
+    test_item *item1 = create_item(1, 100);
+    test_item *item2 = create_item(2, 200);
+    test_item *item3 = create_item(3, 300);
+
+    ll_insert_head(&list.head, &list.commit_id, item1);
+    ll_insert_head(&list.head, &list.commit_id, item2);
+    ll_insert_head(&list.head, &list.commit_id, item3);
+
+    SECTION("Iterator traverses all items in LIFO order")
+    {
+        ll_legacy_iter_t iter;
+        ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+        test_item *first = static_cast<test_item *>(ll_legacy_iter_next(&iter));
+        REQUIRE(first != nullptr);
+        REQUIRE(first->id == 3);
+
+        test_item *second = static_cast<test_item *>(ll_legacy_iter_next(&iter));
+        REQUIRE(second != nullptr);
+        REQUIRE(second->id == 2);
+
+        test_item *third = static_cast<test_item *>(ll_legacy_iter_next(&iter));
+        REQUIRE(third != nullptr);
+        REQUIRE(third->id == 1);
+
+        test_item *fourth = static_cast<test_item *>(ll_legacy_iter_next(&iter));
+        REQUIRE(fourth == nullptr);
+
+        ll_legacy_iter_end(&iter);
+    }
+
+    SECTION("Iterator on empty list returns NULL immediately")
+    {
+        struct test_list_head empty_list;
+        ll_init(&empty_list.head, &empty_list.commit_id);
+
+        ll_legacy_iter_t iter;
+        ll_legacy_iter_begin(&iter, &empty_list.head, &empty_list.commit_id);
+
+        test_item *first = static_cast<test_item *>(ll_legacy_iter_next(&iter));
+        REQUIRE(first == nullptr);
+
+        ll_legacy_iter_end(&iter);
+    }
+
+    /* Cleanup. */
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item2);
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item3);
+    ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
+}
+
+TEST_CASE("Legacy Iterator: Snapshot isolation", "[concurrent_ll][legacy][iterator][snapshot]")
+{
+    struct test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+    list.free_cb = test_item_free;
+
+    /* Insert initial items. */
+    test_item *item1 = create_item(1, 100);
+    test_item *item2 = create_item(2, 200);
+    ll_insert_head(&list.head, &list.commit_id, item1);
+    ll_insert_head(&list.head, &list.commit_id, item2);
+
+    /* Start iteration - captures snapshot. */
+    ll_legacy_iter_t iter;
+    ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+    /* Insert a new item after iteration started. */
+    test_item *item3 = create_item(3, 300);
+    ll_insert_head(&list.head, &list.commit_id, item3);
+
+    /* Iterator should NOT see item3 (added after snapshot). */
+    std::vector<int> seen_ids;
+    test_item *item;
+    while ((item = static_cast<test_item *>(ll_legacy_iter_next(&iter))) != nullptr) {
+        seen_ids.push_back(item->id);
+    }
+    ll_legacy_iter_end(&iter);
+
+    REQUIRE(seen_ids.size() == 2);
+    REQUIRE(std::find(seen_ids.begin(), seen_ids.end(), 1) != seen_ids.end());
+    REQUIRE(std::find(seen_ids.begin(), seen_ids.end(), 2) != seen_ids.end());
+    REQUIRE(std::find(seen_ids.begin(), seen_ids.end(), 3) == seen_ids.end());
+
+    /* A new iterator should see all 3 items. */
+    ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+    seen_ids.clear();
+    while ((item = static_cast<test_item *>(ll_legacy_iter_next(&iter))) != nullptr) {
+        seen_ids.push_back(item->id);
+    }
+    ll_legacy_iter_end(&iter);
+
+    REQUIRE(seen_ids.size() == 3);
+
+    /* Cleanup. */
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item2);
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item3);
+    ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
+}
+
+TEST_CASE("Legacy Iterator: Concurrent iteration and modification", "[concurrent_ll][legacy][iterator][concurrent]")
+{
+    struct test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+    list.free_cb = test_item_free;
+
+    /* Insert initial items. */
+    std::vector<test_item *> items;
+    for (int i = 0; i < 100; ++i) {
+        test_item *item = create_item(i, i * 10);
+        items.push_back(item);
+        ll_insert_head(&list.head, &list.commit_id, item);
+    }
+
+    std::atomic<bool> iterator_done{false};
+    std::atomic<int> items_seen{0};
+
+    /* Iterator thread - uses the O(1) legacy iterator. */
+    std::thread iterator_thread([&]() {
+        ll_legacy_iter_t iter;
+        ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+        test_item *item;
+        while ((item = static_cast<test_item *>(ll_legacy_iter_next(&iter))) != nullptr) {
+            items_seen.fetch_add(1, std::memory_order_relaxed);
+            /* Simulate some work. */
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+
+        ll_legacy_iter_end(&iter);
+        iterator_done.store(true);
+    });
+
+    /* Writer thread - inserts new items while iterator is running. */
+    std::thread writer_thread([&]() {
+        for (int i = 100; i < 150 && !iterator_done.load(); ++i) {
+            test_item *item = create_item(i, i * 10);
+            items.push_back(item);
+            ll_insert_head(&list.head, &list.commit_id, item);
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+        }
+    });
+
+    iterator_thread.join();
+    writer_thread.join();
+
+    /* Iterator should have seen exactly 100 items (the snapshot at begin time). */
+    REQUIRE(items_seen.load() == 100);
+
+    /* Cleanup. */
+    for (auto *item : items) {
+        ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item);
+    }
+    ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
+}
+
+TEST_CASE("Legacy Iterator: Multiple concurrent iterators", "[concurrent_ll][legacy][iterator][concurrent]")
+{
+    struct test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+    list.free_cb = test_item_free;
+
+    /* Insert items. */
+    std::vector<test_item *> items;
+    for (int i = 0; i < 50; ++i) {
+        test_item *item = create_item(i, i * 10);
+        items.push_back(item);
+        ll_insert_head(&list.head, &list.commit_id, item);
+    }
+
+    std::atomic<int> total_items_seen{0};
+    const int num_threads = 4;
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&]() {
+            ll_legacy_iter_t iter;
+            ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+            int count = 0;
+            while (ll_legacy_iter_next(&iter) != nullptr) {
+                ++count;
+            }
+
+            ll_legacy_iter_end(&iter);
+            total_items_seen.fetch_add(count, std::memory_order_relaxed);
+        });
+    }
+
+    for (auto &t : threads) {
+        t.join();
+    }
+
+    /* Each thread should have seen all 50 items. */
+    REQUIRE(total_items_seen.load() == num_threads * 50);
+
+    /* Cleanup. */
+    for (auto *item : items) {
+        ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item);
+    }
+    ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
+}
+
+TEST_CASE("Legacy Iterator: Get snapshot version", "[concurrent_ll][legacy][iterator]")
+{
+    struct test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+    list.free_cb = test_item_free;
+
+    /* Insert an item to advance commit_id. */
+    test_item *item1 = create_item(1, 100);
+    ll_insert_head(&list.head, &list.commit_id, item1);
+
+    ll_legacy_iter_t iter;
+    ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+    uint64_t snapshot = ll_legacy_iter_snapshot(&iter);
+    REQUIRE(snapshot > 0);
+
+    /* Insert another item. */
+    test_item *item2 = create_item(2, 200);
+    ll_insert_head(&list.head, &list.commit_id, item2);
+
+    /* Snapshot should not have changed. */
+    REQUIRE(ll_legacy_iter_snapshot(&iter) == snapshot);
+
+    ll_legacy_iter_end(&iter);
+
+    /* Cleanup. */
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item1);
+    ll_remove(&list.head, &list.commit_id, (void (*)(void *))test_item_free, item2);
+    ll_reclaim(&list.head, &list.commit_id, (void (*)(void *))test_item_free);
+}
+
 /* ==================== Example Use Cases ==================== */
 
 TEST_CASE("Example: Producer-consumer pattern", "[concurrent_ll][example]")

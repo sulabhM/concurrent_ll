@@ -70,6 +70,14 @@ struct ll_iterator_t {
     void *current_node;
 };
 
+/* Legacy iterator structure - matches C layout. */
+struct ll_legacy_iter_t {
+    ll_atomic_uintptr_t *head;
+    ll_commit_id_t *commit_id;
+    uint64_t snapshot;
+    void *current_node;
+};
+
 /* ============== External C Functions ============== */
 
 extern "C" {
@@ -105,6 +113,12 @@ void ll_snapshot_end(void);
 void *ll_snapshot_first_(void *head, void *commit_id, uint64_t snapshot_version);
 void *ll_snapshot_next_(void *head, void *commit_id, uint64_t snapshot_version, const void *elm);
 void ll_reclaim_(void *head, void *commit_id, void (*free_cb)(void *));
+
+/* Legacy Iterator API - O(1) iteration for legacy data structures. */
+void ll_legacy_iter_begin(void *iter, void *head, void *commit_id);
+void *ll_legacy_iter_next(void *iter);
+void ll_legacy_iter_end(void *iter);
+uint64_t ll_legacy_iter_snapshot(const void *iter);
 
 }
 

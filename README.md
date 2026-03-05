@@ -164,6 +164,53 @@ ll_init_(&my_list.head, &my_list.commit_id);
 
 See `list.h` for the complete legacy API.
 
+### Legacy Iterator API
+
+The legacy API originally provided `ll_snapshot_first()` and `ll_snapshot_next()` for iteration, but these have **O(N) complexity per call** because they must scan from the head to find the current position.
+
+For large lists, use the **O(1) legacy iterator** instead:
+
+```c
+#include "list.h"
+
+// Setup: legacy list with some items
+atomic_uintptr_t head;
+ll_commit_id_t commit_id;
+ll_init_(&head, &commit_id);
+
+// Insert items...
+ll_insert_head_(&head, &commit_id, item1);
+ll_insert_head_(&head, &commit_id, item2);
+
+// Efficient O(1) iteration using legacy iterator
+ll_legacy_iter_t iter;
+ll_legacy_iter_begin(&iter, &head, &commit_id);
+
+void *elm;
+while ((elm = ll_legacy_iter_next(&iter)) != NULL) {
+    // Process element - O(1) per call
+    struct item *item = (struct item *)elm;
+    printf("Item: %d\n", item->id);
+}
+
+ll_legacy_iter_end(&iter);  // Always end the iterator!
+```
+
+#### Legacy Iterator Functions
+
+| Function | Description |
+|----------|-------------|
+| `ll_legacy_iter_begin(iter, head, commit_id)` | Initialize iterator with snapshot. Must be paired with `_end()`. |
+| `ll_legacy_iter_next(iter)` | Get next visible element. Returns NULL when exhausted. **O(1) amortized.** |
+| `ll_legacy_iter_end(iter)` | End iteration and release snapshot. |
+| `ll_legacy_iter_snapshot(iter)` | Get the snapshot version captured at `_begin()`. |
+
+#### When to Use Legacy Iterator
+
+- **Use `ll_legacy_iter_*`** when iterating over lists with many elements (100+)
+- **Use `ll_snapshot_first/next`** only for short lists or when you need to restart iteration from a known element
+- The iterator maintains an internal cursor, so it cannot be used to "jump" to a specific element
+
 ## C++ Usage
 
 For C++ projects, include the compatibility wrapper:
@@ -188,14 +235,58 @@ int main() {
     Item *item = new Item{42};
     ll_insert_head(&list, item);
 
-    // Use ll_snapshot_begin_cxx for type-safe snapshot
-    uint64_t snap = ll_snapshot_begin_cxx(&list.commit_id);
-    // ... iterate ...
-    ll_snapshot_end();
+    // Efficient iteration using the new API iterator
+    ll_iterator_t iter;
+    ll_iterator_begin(&list, &iter);
+    void *elm;
+    while ((elm = ll_iterator_next(&iter)) != nullptr) {
+        Item *it = static_cast<Item*>(elm);
+        // Process item...
+    }
+    ll_iterator_end(&iter);
 
     ll_destroy(&list, [](void *p) { delete static_cast<Item*>(p); });
     ll_thread_unregister(domain);
     ll_domain_destroy(domain);
+}
+```
+
+### C++ with Legacy API
+
+For legacy lists using raw `atomic_uintptr_t` head and `ll_commit_id_t`:
+
+```cpp
+#include "list_cxx.h"
+
+// Legacy list structure
+struct test_list_head {
+    ll_atomic_uintptr_t head;
+    ll_commit_id_t commit_id;
+};
+
+int main() {
+    test_list_head list;
+    ll_init(&list.head, &list.commit_id);
+
+    // Insert items...
+    Item *item1 = new Item{1};
+    Item *item2 = new Item{2};
+    ll_insert_head(&list.head, &list.commit_id, item1);
+    ll_insert_head(&list.head, &list.commit_id, item2);
+
+    // Efficient O(1) iteration with legacy iterator
+    ll_legacy_iter_t iter;
+    ll_legacy_iter_begin(&iter, &list.head, &list.commit_id);
+
+    void *elm;
+    while ((elm = ll_legacy_iter_next(&iter)) != nullptr) {
+        Item *it = static_cast<Item*>(elm);
+        std::cout << "Item ID: " << it->id << std::endl;
+    }
+
+    ll_legacy_iter_end(&iter);
+
+    // Cleanup...
 }
 ```
 
@@ -273,7 +364,7 @@ cmake --install . --prefix /usr/local
 
 ## Testing
 
-The test suite includes 43 test cases with ~1400 assertions covering:
+The test suite includes 51 test cases with ~1550 assertions covering:
 
 - Domain and thread management
 - Insert, remove, and iteration operations
@@ -281,6 +372,7 @@ The test suite includes 43 test cases with ~1400 assertions covering:
 - Memory reclamation
 - MVCC visibility semantics
 - Legacy API compatibility
+- Legacy iterator API
 
 Run tests with verbose output:
 ```bash

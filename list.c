@@ -1130,3 +1130,75 @@ void ll_reclaim_(atomic_uintptr_t *head, ll_commit_id_t *commit_id,
     }
     state->retired_list = still_held;
 }
+
+/* ============== Legacy Iterator API ============== */
+
+void ll_legacy_iter_begin(ll_legacy_iter_t *iter, atomic_uintptr_t *head,
+                          ll_commit_id_t *commit_id)
+{
+    ensure_legacy_thread_registered();
+
+    iter->head = head;
+    iter->commit_id = commit_id;
+    iter->snapshot = atomic_load_explicit(commit_id, memory_order_acquire);
+    iter->current_node = NULL;
+
+    /* Record snapshot in thread state for reclamation safety. */
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (state) {
+        atomic_store_explicit(&state->active_snapshot, iter->snapshot,
+                              memory_order_release);
+    }
+}
+
+void *ll_legacy_iter_next(ll_legacy_iter_t *iter)
+{
+    ll_thread_state_t *state = get_tls_thread_state();
+    versioned_node_t *curr;
+
+    if (iter->current_node == NULL) {
+        /* First call: start from head. */
+        curr = ptr_unmask(atomic_load_explicit(iter->head, memory_order_acquire));
+    } else {
+        /* Subsequent calls: continue from where we left off. */
+        versioned_node_t *prev = (versioned_node_t *)iter->current_node;
+        curr = ptr_unmask(atomic_load_explicit(&prev->next, memory_order_acquire));
+    }
+
+    /* Find next visible node. */
+    while (curr) {
+        if (state)
+            hp_acquire(state, 0, curr);
+
+        if (node_visible(curr, iter->snapshot)) {
+            iter->current_node = curr;
+            if (state)
+                hp_release(state, 0);
+            return curr->user_elm;
+        }
+
+        versioned_node_t *next = ptr_unmask(
+            atomic_load_explicit(&curr->next, memory_order_acquire));
+        if (state)
+            hp_release(state, 0);
+        curr = next;
+    }
+
+    iter->current_node = NULL;
+    return NULL;
+}
+
+void ll_legacy_iter_end(ll_legacy_iter_t *iter)
+{
+    ll_thread_state_t *state = get_tls_thread_state();
+    if (state) {
+        atomic_store_explicit(&state->active_snapshot, (uint64_t)0,
+                              memory_order_release);
+    }
+    iter->current_node = NULL;
+}
+
+uint64_t ll_legacy_iter_snapshot(const ll_legacy_iter_t *iter)
+{
+    return iter->snapshot;
+}
